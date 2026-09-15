@@ -19,6 +19,9 @@ use crate::output::PixelFormat;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const KEY_ESC: u32 = 1;
+const CURSOR_SIZE: u32 = 25;
+const CURSOR_HOTSPOT: i32 = 12;
+const BANNER_TEXT: &str = "DRAG TO SELECT - ESC OR RIGHT CLICK TO CANCEL";
 
 pub struct CaptureResult {
     pub bytes: Vec<u8>,
@@ -63,6 +66,17 @@ struct Overlay {
     redraw_pending: bool,
 }
 
+struct Cursor {
+    surface: wl_surface::WlSurface,
+    _buffer: OverlayBuffer,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BannerPosition {
+    Top,
+    Bottom,
+}
+
 #[derive(Clone, Copy)]
 struct BufferId {
     overlay: usize,
@@ -91,6 +105,7 @@ struct State {
     outputs: Vec<OutputInfo>,
     captures: Vec<CaptureJob>,
     overlays: Vec<Overlay>,
+    cursor: Option<Cursor>,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer_focus: Option<usize>,
@@ -111,6 +126,7 @@ impl State {
             outputs: Vec::new(),
             captures: Vec::new(),
             overlays: Vec::new(),
+            cursor: None,
             pointer: None,
             keyboard: None,
             pointer_focus: None,
@@ -146,6 +162,18 @@ impl State {
             });
         }
         Ok(())
+    }
+
+    fn banner_position(&self, output: usize) -> Option<BannerPosition> {
+        if self.drag.is_some() || self.pointer_focus != Some(output) {
+            return None;
+        }
+        let height = self.overlays.get(output)?.logical_height;
+        Some(if self.pointer_position.y >= height as i32 / 2 {
+            BannerPosition::Top
+        } else {
+            BannerPosition::Bottom
+        })
     }
 
     fn captures_complete(&self) -> bool {
@@ -198,6 +226,29 @@ impl State {
                 redraw_pending: false,
             });
         }
+        let cursor_surface = compositor.create_surface(qh, usize::MAX);
+        let mut cursor_buffer = make_buffer(
+            self.shm
+                .as_ref()
+                .ok_or("compositor does not advertise wl_shm")?,
+            CURSOR_SIZE,
+            CURSOR_SIZE,
+            CURSOR_SIZE * 4,
+            wl_shm::Format::Argb8888,
+            qh,
+            (),
+        )?;
+        cursor_buffer
+            .file
+            .write_all(&draw_crosshair_cursor())
+            .map_err(|e| format!("cannot draw cursor: {e}"))?;
+        cursor_surface.attach(Some(&cursor_buffer.buffer), 0, 0);
+        cursor_surface.damage_buffer(0, 0, CURSOR_SIZE as i32, CURSOR_SIZE as i32);
+        cursor_surface.commit();
+        self.cursor = Some(Cursor {
+            surface: cursor_surface,
+            _buffer: cursor_buffer,
+        });
         Ok(())
     }
 
@@ -228,7 +279,9 @@ impl State {
                 self.captures[index].height,
             )
         });
-        let rendered = draw_dimmed(&self.captures[index], crop)?;
+        let banner = self.banner_position(index);
+        let display_scale = (self.captures[index].width / logical_width).max(1);
+        let rendered = draw_dimmed(&self.captures[index], crop, banner, display_scale)?;
 
         let free_slot = self.overlays[index]
             .buffers
@@ -438,7 +491,12 @@ where
     })
 }
 
-fn draw_dimmed(capture: &CaptureJob, crop: Option<Rect>) -> Result<Vec<u8>, String> {
+fn draw_dimmed(
+    capture: &CaptureJob,
+    crop: Option<Rect>,
+    banner: Option<BannerPosition>,
+    display_scale: u32,
+) -> Result<Vec<u8>, String> {
     let source = capture
         .bytes
         .as_ref()
@@ -463,7 +521,150 @@ fn draw_dimmed(capture: &CaptureJob, crop: Option<Rect>) -> Result<Vec<u8>, Stri
         }
         draw_border(&mut result, capture.stride, rect);
     }
+    if let Some(position) = banner {
+        draw_banner(
+            &mut result,
+            capture.width,
+            capture.height,
+            capture.stride,
+            position,
+            display_scale,
+        );
+    }
     Ok(result)
+}
+
+fn draw_crosshair_cursor() -> Vec<u8> {
+    let mut bytes = vec![0; (CURSOR_SIZE * CURSOR_SIZE * 4) as usize];
+    let center = CURSOR_SIZE / 2;
+    for y in 0..CURSOR_SIZE {
+        for x in 0..CURSOR_SIZE {
+            let distance = x.abs_diff(center).min(y.abs_diff(center));
+            let on_axis = x == center || y == center;
+            let outline = distance == 1 && (x.abs_diff(center) >= 4 || y.abs_diff(center) >= 4);
+            let visible =
+                (on_axis && (x.abs_diff(center) >= 3 || y.abs_diff(center) >= 3)) || outline;
+            if visible {
+                let offset = ((y * CURSOR_SIZE + x) * 4) as usize;
+                let color = if on_axis { 255 } else { 24 };
+                bytes[offset..offset + 4].copy_from_slice(&[color, color, color, 255]);
+            }
+        }
+    }
+    bytes
+}
+
+fn draw_banner(
+    bytes: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    position: BannerPosition,
+    display_scale: u32,
+) {
+    let margin = 12 * display_scale;
+    let padding_x = 10 * display_scale;
+    let padding_y = 7 * display_scale;
+    let wide_scale = 2 * display_scale;
+    let wide_text_width = BANNER_TEXT.len() as u32 * 6 * wide_scale - wide_scale;
+    let font_scale = if wide_text_width + 2 * (margin + padding_x) <= width {
+        wide_scale
+    } else {
+        display_scale
+    };
+    let text_width = BANNER_TEXT.len() as u32 * 6 * font_scale - font_scale;
+    let banner_width = (text_width + 2 * padding_x).min(width.saturating_sub(2 * margin));
+    let banner_height = 7 * font_scale + 2 * padding_y;
+    if banner_width == 0 || banner_height + 2 * margin > height {
+        return;
+    }
+    let left = (width - banner_width) / 2;
+    let top = match position {
+        BannerPosition::Top => margin,
+        BannerPosition::Bottom => height - margin - banner_height,
+    };
+
+    for y in top..top + banner_height {
+        for x in left..left + banner_width {
+            let offset = y as usize * stride as usize + x as usize * 4;
+            bytes[offset] = bytes[offset] * 2 / 5;
+            bytes[offset + 1] = bytes[offset + 1] * 2 / 5;
+            bytes[offset + 2] = bytes[offset + 2] * 2 / 5;
+            bytes[offset + 3] = 255;
+        }
+    }
+
+    let text_left = left + (banner_width.saturating_sub(text_width)) / 2;
+    let text_top = top + padding_y;
+    for (character_index, character) in BANNER_TEXT.chars().enumerate() {
+        let glyph_left = text_left + character_index as u32 * 6 * font_scale;
+        for (row, bits) in glyph(character).into_iter().enumerate() {
+            for column in 0..5 {
+                if bits & (1 << (4 - column)) == 0 {
+                    continue;
+                }
+                for dy in 0..font_scale {
+                    for dx in 0..font_scale {
+                        let x = glyph_left + column * font_scale + dx;
+                        let y = text_top + row as u32 * font_scale + dy;
+                        if x < left + banner_width && y < height {
+                            let offset = y as usize * stride as usize + x as usize * 4;
+                            bytes[offset..offset + 4].copy_from_slice(&[238, 238, 238, 255]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn glyph(character: char) -> [u8; 7] {
+    match character {
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'C' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'G' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        '-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        _ => [0; 7],
+    }
 }
 
 fn draw_border(bytes: &mut [u8], stride: u32, rect: Rect) {
@@ -686,7 +887,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, usize> for State {
 impl Dispatch<wl_pointer::WlPointer, ()> for State {
     fn event(
         state: &mut Self,
-        _: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         event: wl_pointer::Event,
         _: &(),
         _: &Connection,
@@ -694,11 +895,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
     ) {
         match event {
             wl_pointer::Event::Enter {
+                serial,
                 surface,
                 surface_x,
                 surface_y,
                 ..
             } => {
+                let previous_focus = state.pointer_focus;
                 state.pointer_focus = state
                     .overlays
                     .iter()
@@ -707,23 +910,62 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     x: surface_x.floor() as i32,
                     y: surface_y.floor() as i32,
                 };
+                if let Some(cursor) = &state.cursor {
+                    pointer.set_cursor(
+                        serial,
+                        Some(&cursor.surface),
+                        CURSOR_HOTSPOT,
+                        CURSOR_HOTSPOT,
+                    );
+                }
+                if let Some(previous) = previous_focus
+                    && previous != state.pointer_focus.unwrap_or(usize::MAX)
+                    && let Err(error) = state.render_overlay(previous, qh)
+                {
+                    state.fail(error);
+                }
+                if let Some(output) = state.pointer_focus
+                    && let Err(error) = state.render_overlay(output, qh)
+                {
+                    state.fail(error);
+                }
+            }
+            wl_pointer::Event::Leave { surface, .. } => {
+                let previous = state
+                    .overlays
+                    .iter()
+                    .position(|overlay| overlay.surface.id() == surface.id());
+                state.pointer_focus = None;
+                if let Some(output) = previous
+                    && let Err(error) = state.render_overlay(output, qh)
+                {
+                    state.fail(error);
+                }
             }
             wl_pointer::Event::Motion {
                 surface_x,
                 surface_y,
                 ..
             } => {
+                let focused = state.pointer_focus;
+                let old_banner = focused.and_then(|output| state.banner_position(output));
                 state.pointer_position = Point {
                     x: surface_x.floor() as i32,
                     y: surface_y.floor() as i32,
                 };
-                let Some(mut drag) = state.drag else { return };
-                if state.pointer_focus == Some(drag.output) {
+                if let Some(mut drag) = state.drag
+                    && state.pointer_focus == Some(drag.output)
+                {
                     drag.current = state.pointer_position;
                     state.drag = Some(drag);
                     if let Err(error) = state.render_overlay(drag.output, qh) {
                         state.fail(error);
                     }
+                } else if let Some(output) = focused
+                    && old_banner != state.banner_position(output)
+                    && let Err(error) = state.render_overlay(output, qh)
+                {
+                    state.fail(error);
                 }
             }
             wl_pointer::Event::Button {
@@ -743,16 +985,25 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                             start: state.pointer_position,
                             current: state.pointer_position,
                         });
+                        if let Err(error) = state.render_overlay(output, qh) {
+                            state.fail(error);
+                        }
                     }
                 } else if button == BTN_LEFT
                     && button_state == wl_pointer::ButtonState::Released
                     && let Some(drag) = state.drag
-                    && let Some(rect) = state.current_rect(drag.output)
                 {
-                    state.outcome = Outcome::Accepted {
-                        output: drag.output,
-                        rect,
-                    };
+                    if let Some(rect) = state.current_rect(drag.output) {
+                        state.outcome = Outcome::Accepted {
+                            output: drag.output,
+                            rect,
+                        };
+                    } else {
+                        state.drag = None;
+                        if let Err(error) = state.render_overlay(drag.output, qh) {
+                            state.fail(error);
+                        }
+                    }
                 }
             }
             _ => {}

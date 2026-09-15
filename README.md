@@ -31,6 +31,10 @@ or right click to cancel. Cancellation exits with status 2 and does not touch
 the requested file. With no file argument the crop is copied only to the
 clipboard; with a file argument it is both saved and copied.
 
+The selection overlay uses a crosshair cursor and shows a small instruction
+banner on the edge opposite the pointer. The banner disappears while dragging
+and is never included in the resulting crop.
+
 For example, a Sway binding can invoke:
 
 ```text
