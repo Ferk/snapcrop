@@ -1,0 +1,55 @@
+# snapcrop
+
+`snapcrop` captures the Wayland desktop first and then lets you crop the frozen
+image. The crop is written to a PNG file and copied to the clipboard.
+
+It is deliberately small: there is no GUI toolkit, GPU renderer, async runtime,
+or dependency on `grim`, `slurp`, `wayshot`, or `wl-copy` at runtime.
+
+## Requirements
+
+A wlroots-based compositor exposing these protocols:
+
+- `zwlr_screencopy_manager_v1`
+- `zwlr_layer_shell_v1`
+- `zwlr_data_control_manager_v1`
+
+Sway, Hyprland, River, and other wlroots compositors commonly provide them.
+GNOME and KDE are not currently supported because they use different capture
+paths.
+
+## Build and run
+
+```sh
+cargo build --release
+./target/release/snapcrop
+./target/release/snapcrop screenshot.png
+```
+
+Drag with the left mouse button to select. Release to save, or press `Escape`
+or right click to cancel. Cancellation exits with status 2 and does not touch
+the requested file. With no file argument the crop is copied only to the
+clipboard; with a file argument it is both saved and copied.
+
+For example, a Sway binding can invoke:
+
+```text
+bindsym Print exec snapcrop "$HOME/Pictures/screenshot.png"
+```
+
+The first version captures and freezes every output, but a selection must stay
+within the output on which it begins. Cross-output selection and portal support
+are intentionally deferred; see [TODO.md](TODO.md).
+
+## Development
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+The release binary links only the Rust/Wayland protocol stack and a PNG encoder.
+Clipboard contents are served by a background instance of the same executable,
+which exits when another application replaces the clipboard.
+

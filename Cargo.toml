@@ -1,0 +1,18 @@
+[package]
+name = "snapcrop"
+version = "0.1.0"
+edition = "2026"
+description = "Capture and crop a frozen Wayland desktop"
+license = "MIT"
+
+[dependencies]
+png = "0.18"
+rustix = { version = "1.1", features = ["fs"] }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+
