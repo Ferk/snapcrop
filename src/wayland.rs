@@ -8,6 +8,7 @@ use wayland_client::protocol::{
     wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop};
+use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
@@ -35,6 +36,12 @@ pub struct CaptureResult {
 struct OutputInfo {
     proxy: wl_output::WlOutput,
     scale: i32,
+    x: i32,
+    y: i32,
+    logical_width: u32,
+    logical_height: u32,
+    position_known: bool,
+    _xdg_output: Option<zxdg_output_v1::ZxdgOutputV1>,
 }
 
 struct CaptureJob {
@@ -85,14 +92,21 @@ struct BufferId {
 
 #[derive(Clone, Copy)]
 struct Drag {
-    output: usize,
-    start: Point,
-    current: Point,
+    start_global: Point,
+    current_global: Point,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlobalRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
 
 enum Outcome {
     Selecting,
-    Accepted { output: usize, rect: Rect },
+    Accepted { rect: GlobalRect },
     Cancelled,
 }
 
@@ -102,6 +116,7 @@ struct State {
     seat: Option<wl_seat::WlSeat>,
     screencopy: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
     layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    xdg_output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     outputs: Vec<OutputInfo>,
     captures: Vec<CaptureJob>,
     overlays: Vec<Overlay>,
@@ -123,6 +138,7 @@ impl State {
             seat: None,
             screencopy: None,
             layer_shell: None,
+            xdg_output_manager: None,
             outputs: Vec::new(),
             captures: Vec::new(),
             overlays: Vec::new(),
@@ -162,6 +178,15 @@ impl State {
             });
         }
         Ok(())
+    }
+
+    fn begin_output_info(&mut self, qh: &QueueHandle<Self>) {
+        let Some(manager) = self.xdg_output_manager.clone() else {
+            return;
+        };
+        for (index, output) in self.outputs.iter_mut().enumerate() {
+            output._xdg_output = Some(manager.get_xdg_output(&output.proxy, qh, index));
+        }
     }
 
     fn banner_position(&self, output: usize) -> Option<BannerPosition> {
@@ -252,15 +277,53 @@ impl State {
         Ok(())
     }
 
-    fn current_rect(&self, output: usize) -> Option<Rect> {
-        let drag = self.drag.filter(|drag| drag.output == output)?;
-        let overlay = self.overlays.get(output)?;
-        Rect::from_points(
-            drag.start,
-            drag.current,
-            overlay.logical_width,
-            overlay.logical_height,
-        )
+    fn pointer_global(&self) -> Option<Point> {
+        let output = self.outputs.get(self.pointer_focus?)?;
+        Some(Point {
+            x: output.x + self.pointer_position.x,
+            y: output.y + self.pointer_position.y,
+        })
+    }
+
+    fn current_global_rect(&self) -> Option<GlobalRect> {
+        let drag = self.drag?;
+        let x = drag.start_global.x.min(drag.current_global.x);
+        let y = drag.start_global.y.min(drag.current_global.y);
+        let width = drag.start_global.x.abs_diff(drag.current_global.x);
+        let height = drag.start_global.y.abs_diff(drag.current_global.y);
+        (width > 0 && height > 0).then_some(GlobalRect {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn selection_for_output(&self, index: usize) -> Option<Rect> {
+        let selection = self.current_global_rect()?;
+        let output = self.outputs.get(index)?;
+        let intersection = intersect_global(
+            selection,
+            GlobalRect {
+                x: output.x,
+                y: output.y,
+                width: output.logical_width,
+                height: output.logical_height,
+            },
+        )?;
+        Some(Rect {
+            x: (intersection.x - output.x) as u32,
+            y: (intersection.y - output.y) as u32,
+            width: intersection.width,
+            height: intersection.height,
+        })
+    }
+
+    fn render_all_overlays(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        for index in 0..self.overlays.len() {
+            self.render_overlay(index, qh)?;
+        }
+        Ok(())
     }
 
     fn render_overlay(&mut self, index: usize, qh: &QueueHandle<Self>) -> Result<(), String> {
@@ -271,7 +334,7 @@ impl State {
         if logical_width == 0 || logical_height == 0 {
             return Ok(());
         }
-        let crop = self.current_rect(index).map(|rect| {
+        let crop = self.selection_for_output(index).map(|rect| {
             rect.to_buffer(
                 logical_width,
                 logical_height,
@@ -348,6 +411,7 @@ pub fn select_region() -> Result<CaptureResult, String> {
     queue
         .roundtrip(&mut state)
         .map_err(|e| format!("Wayland registry dispatch failed: {e}"))?;
+    state.begin_output_info(&qh);
     queue
         .roundtrip(&mut state)
         .map_err(|e| format!("Wayland output dispatch failed: {e}"))?;
@@ -364,6 +428,18 @@ pub fn select_region() -> Result<CaptureResult, String> {
     {
         return Err(error);
     }
+    for (index, output) in state.outputs.iter_mut().enumerate() {
+        let scale = output.scale.max(1) as u32;
+        if output.logical_width == 0 {
+            output.logical_width = state.captures[index].width / scale;
+        }
+        if output.logical_height == 0 {
+            output.logical_height = state.captures[index].height / scale;
+        }
+    }
+    if state.outputs.len() > 1 && state.outputs.iter().any(|output| !output.position_known) {
+        return Err("compositor did not report logical positions for every output".into());
+    }
     state.begin_overlays(&qh)?;
     while matches!(state.outcome, Outcome::Selecting) {
         queue
@@ -375,25 +451,115 @@ pub fn select_region() -> Result<CaptureResult, String> {
     }
 
     match state.outcome {
-        Outcome::Accepted { output, rect } => {
-            let capture = &mut state.captures[output];
-            let crop = rect.to_buffer(
-                state.overlays[output].logical_width,
-                state.overlays[output].logical_height,
-                capture.width,
-                capture.height,
-            );
-            Ok(CaptureResult {
-                bytes: capture.bytes.take().expect("completed capture has bytes"),
-                width: capture.width,
-                height: capture.height,
-                stride: capture.stride,
-                format: capture.format.expect("completed capture has format"),
-                crop,
-            })
-        }
+        Outcome::Accepted { rect } => compose_outputs(&state, rect),
         Outcome::Cancelled | Outcome::Selecting => Err("selection cancelled".into()),
     }
+}
+
+fn intersect_global(a: GlobalRect, b: GlobalRect) -> Option<GlobalRect> {
+    let left = i64::from(a.x).max(i64::from(b.x));
+    let top = i64::from(a.y).max(i64::from(b.y));
+    let right = (i64::from(a.x) + i64::from(a.width)).min(i64::from(b.x) + i64::from(b.width));
+    let bottom = (i64::from(a.y) + i64::from(a.height)).min(i64::from(b.y) + i64::from(b.height));
+    (right > left && bottom > top).then_some(GlobalRect {
+        x: left as i32,
+        y: top as i32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    })
+}
+
+fn compose_outputs(state: &State, selection: GlobalRect) -> Result<CaptureResult, String> {
+    let mut intersections = Vec::new();
+    let mut target_scale = 1_u32;
+    for (index, output) in state.outputs.iter().enumerate() {
+        let bounds = GlobalRect {
+            x: output.x,
+            y: output.y,
+            width: output.logical_width,
+            height: output.logical_height,
+        };
+        if let Some(intersection) = intersect_global(selection, bounds) {
+            let scale_x = state.captures[index]
+                .width
+                .div_ceil(output.logical_width.max(1));
+            let scale_y = state.captures[index]
+                .height
+                .div_ceil(output.logical_height.max(1));
+            target_scale = target_scale.max(scale_x).max(scale_y);
+            intersections.push((index, intersection));
+        }
+    }
+    if intersections.is_empty() {
+        return Err("selection does not intersect an output".into());
+    }
+
+    let width = selection
+        .width
+        .checked_mul(target_scale)
+        .ok_or("selected image is too wide")?;
+    let height = selection
+        .height
+        .checked_mul(target_scale)
+        .ok_or("selected image is too tall")?;
+    let stride = width
+        .checked_mul(4)
+        .ok_or("selected image row is too wide")?;
+    let length = usize::try_from(stride)
+        .ok()
+        .and_then(|stride| stride.checked_mul(height as usize))
+        .ok_or("selected image is too large")?;
+    let mut bytes = vec![0_u8; length];
+
+    for (index, intersection) in intersections {
+        let output = &state.outputs[index];
+        let capture = &state.captures[index];
+        let source = capture
+            .bytes
+            .as_ref()
+            .ok_or("captured output pixels are unavailable")?;
+        let local_x = (intersection.x - output.x) as u32;
+        let local_y = (intersection.y - output.y) as u32;
+        let destination_x = (intersection.x - selection.x) as u32 * target_scale;
+        let destination_y = (intersection.y - selection.y) as u32 * target_scale;
+        let destination_width = intersection.width * target_scale;
+        let destination_height = intersection.height * target_scale;
+
+        for dy in 0..destination_height {
+            let source_y_numerator = (u64::from(local_y) * u64::from(target_scale)) + u64::from(dy);
+            let source_y = (source_y_numerator * u64::from(capture.height)
+                / (u64::from(output.logical_height) * u64::from(target_scale)))
+                as u32;
+            for dx in 0..destination_width {
+                let source_x_numerator =
+                    (u64::from(local_x) * u64::from(target_scale)) + u64::from(dx);
+                let source_x = (source_x_numerator * u64::from(capture.width)
+                    / (u64::from(output.logical_width) * u64::from(target_scale)))
+                    as u32;
+                let source_offset =
+                    source_y as usize * capture.stride as usize + source_x as usize * 4;
+                let target_offset = (destination_y + dy) as usize * stride as usize
+                    + (destination_x + dx) as usize * 4;
+                bytes[target_offset..target_offset + 3]
+                    .copy_from_slice(&source[source_offset..source_offset + 3]);
+                bytes[target_offset + 3] = 255;
+            }
+        }
+    }
+
+    Ok(CaptureResult {
+        bytes,
+        width,
+        height,
+        stride,
+        format: PixelFormat::Argb8888,
+        crop: Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+    })
 }
 
 fn make_file(size: u64) -> Result<File, String> {
@@ -713,13 +879,25 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "wl_output" => {
                 let index = state.outputs.len();
                 let proxy = registry.bind(name, version.min(4), qh, index);
-                state.outputs.push(OutputInfo { proxy, scale: 1 });
+                state.outputs.push(OutputInfo {
+                    proxy,
+                    scale: 1,
+                    x: 0,
+                    y: 0,
+                    logical_width: 0,
+                    logical_height: 0,
+                    position_known: false,
+                    _xdg_output: None,
+                });
             }
             "zwlr_screencopy_manager_v1" if state.screencopy.is_none() => {
                 state.screencopy = Some(registry.bind(name, version.min(3), qh, ()));
             }
             "zwlr_layer_shell_v1" if state.layer_shell.is_none() => {
                 state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
+            }
+            "zxdg_output_manager_v1" if state.xdg_output_manager.is_none() => {
+                state.xdg_output_manager = Some(registry.bind(name, version.min(3), qh, ()));
             }
             _ => {}
         }
@@ -735,10 +913,44 @@ impl Dispatch<wl_output::WlOutput, usize> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Scale { factor } = event
-            && let Some(output) = state.outputs.get_mut(*index)
-        {
-            output.scale = factor.max(1);
+        let Some(output) = state.outputs.get_mut(*index) else {
+            return;
+        };
+        match event {
+            wl_output::Event::Scale { factor } => output.scale = factor.max(1),
+            wl_output::Event::Geometry { x, y, .. } => {
+                output.x = x;
+                output.y = y;
+                output.position_known = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zxdg_output_v1::ZxdgOutputV1, usize> for State {
+    fn event(
+        state: &mut Self,
+        _: &zxdg_output_v1::ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        index: &usize,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(output) = state.outputs.get_mut(*index) else {
+            return;
+        };
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                output.x = x;
+                output.y = y;
+                output.position_known = true;
+            }
+            zxdg_output_v1::Event::LogicalSize { width, height } => {
+                output.logical_width = width.max(0) as u32;
+                output.logical_height = height.max(0) as u32;
+            }
+            _ => {}
         }
     }
 }
@@ -874,6 +1086,10 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, usize> for State {
                     overlay.logical_width = width;
                     overlay.logical_height = height;
                 }
+                if let Some(output) = state.outputs.get_mut(*index) {
+                    output.logical_width = width;
+                    output.logical_height = height;
+                }
                 if let Err(error) = state.render_overlay(*index, qh) {
                     state.fail(error);
                 }
@@ -918,16 +1134,26 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                         CURSOR_HOTSPOT,
                     );
                 }
-                if let Some(previous) = previous_focus
-                    && previous != state.pointer_focus.unwrap_or(usize::MAX)
-                    && let Err(error) = state.render_overlay(previous, qh)
-                {
-                    state.fail(error);
-                }
-                if let Some(output) = state.pointer_focus
-                    && let Err(error) = state.render_overlay(output, qh)
-                {
-                    state.fail(error);
+                if let Some(mut drag) = state.drag {
+                    if let Some(global) = state.pointer_global() {
+                        drag.current_global = global;
+                        state.drag = Some(drag);
+                    }
+                    if let Err(error) = state.render_all_overlays(qh) {
+                        state.fail(error);
+                    }
+                } else {
+                    if let Some(previous) = previous_focus
+                        && previous != state.pointer_focus.unwrap_or(usize::MAX)
+                        && let Err(error) = state.render_overlay(previous, qh)
+                    {
+                        state.fail(error);
+                    }
+                    if let Some(output) = state.pointer_focus
+                        && let Err(error) = state.render_overlay(output, qh)
+                    {
+                        state.fail(error);
+                    }
                 }
             }
             wl_pointer::Event::Leave { surface, .. } => {
@@ -953,12 +1179,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     x: surface_x.floor() as i32,
                     y: surface_y.floor() as i32,
                 };
-                if let Some(mut drag) = state.drag
-                    && state.pointer_focus == Some(drag.output)
-                {
-                    drag.current = state.pointer_position;
-                    state.drag = Some(drag);
-                    if let Err(error) = state.render_overlay(drag.output, qh) {
+                if let Some(mut drag) = state.drag {
+                    if let Some(global) = state.pointer_global() {
+                        drag.current_global = global;
+                        state.drag = Some(drag);
+                    }
+                    if let Err(error) = state.render_all_overlays(qh) {
                         state.fail(error);
                     }
                 } else if let Some(output) = focused
@@ -979,28 +1205,24 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 if button == BTN_RIGHT && button_state == wl_pointer::ButtonState::Pressed {
                     state.outcome = Outcome::Cancelled;
                 } else if button == BTN_LEFT && button_state == wl_pointer::ButtonState::Pressed {
-                    if let Some(output) = state.pointer_focus {
+                    if let Some(global) = state.pointer_global() {
                         state.drag = Some(Drag {
-                            output,
-                            start: state.pointer_position,
-                            current: state.pointer_position,
+                            start_global: global,
+                            current_global: global,
                         });
-                        if let Err(error) = state.render_overlay(output, qh) {
+                        if let Err(error) = state.render_all_overlays(qh) {
                             state.fail(error);
                         }
                     }
                 } else if button == BTN_LEFT
                     && button_state == wl_pointer::ButtonState::Released
-                    && let Some(drag) = state.drag
+                    && state.drag.is_some()
                 {
-                    if let Some(rect) = state.current_rect(drag.output) {
-                        state.outcome = Outcome::Accepted {
-                            output: drag.output,
-                            rect,
-                        };
+                    if let Some(rect) = state.current_global_rect() {
+                        state.outcome = Outcome::Accepted { rect };
                     } else {
                         state.drag = None;
-                        if let Err(error) = state.render_overlay(drag.output, qh) {
+                        if let Err(error) = state.render_all_overlays(qh) {
                             state.fail(error);
                         }
                     }
@@ -1064,6 +1286,7 @@ delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1);
 delegate_noop!(State: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+delegate_noop!(State: ignore zxdg_output_manager_v1::ZxdgOutputManagerV1);
 
 impl Dispatch<wl_surface::WlSurface, usize> for State {
     fn event(
@@ -1074,5 +1297,48 @@ impl Dispatch<wl_surface::WlSurface, usize> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intersects_outputs_in_global_space() {
+        let selection = GlobalRect {
+            x: -50,
+            y: 20,
+            width: 200,
+            height: 80,
+        };
+        let output = GlobalRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let intersection = intersect_global(selection, output).unwrap();
+        assert_eq!(intersection.x, 0);
+        assert_eq!(intersection.y, 20);
+        assert_eq!(intersection.width, 100);
+        assert_eq!(intersection.height, 80);
+    }
+
+    #[test]
+    fn rejects_monitor_gap_as_an_intersection() {
+        let selection = GlobalRect {
+            x: 110,
+            y: 10,
+            width: 20,
+            height: 20,
+        };
+        let output = GlobalRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        assert!(intersect_global(selection, output).is_none());
     }
 }

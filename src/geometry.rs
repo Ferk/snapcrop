@@ -13,6 +13,7 @@ pub struct Rect {
 }
 
 impl Rect {
+    #[cfg(test)]
     pub fn from_points(a: Point, b: Point, bounds_width: u32, bounds_height: u32) -> Option<Self> {
         let max_x = i32::try_from(bounds_width).unwrap_or(i32::MAX);
         let max_y = i32::try_from(bounds_height).unwrap_or(i32::MAX);

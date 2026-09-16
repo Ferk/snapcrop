@@ -41,9 +41,10 @@ For example, a Sway binding can invoke:
 bindsym Print exec snapcrop "$HOME/Pictures/screenshot.png"
 ```
 
-The first version captures and freezes every output, but a selection must stay
-within the output on which it begins. Cross-output selection and portal support
-are intentionally deferred; see [TODO.md](TODO.md).
+Every output is captured and frozen before selection starts. A drag may cross
+output boundaries; mixed-scale captures are stitched at the highest selected
+output scale, with transparent pixels for gaps in the physical layout. Portal
+support remains intentionally deferred; see [TODO.md](TODO.md).
 
 ## Development
 

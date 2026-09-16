@@ -9,6 +9,7 @@ license = "MIT"
 png = "0.18"
 rustix = { version = "1.1", features = ["fs"] }
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [profile.release]
