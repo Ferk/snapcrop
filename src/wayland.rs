@@ -24,6 +24,55 @@ const CURSOR_SIZE: u32 = 25;
 const CURSOR_HOTSPOT: i32 = 12;
 const BANNER_TEXT: &str = "DRAG TO SELECT - ESC OR RIGHT CLICK TO CANCEL";
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum OutputTransform {
+    #[default]
+    Normal,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    Flipped,
+    Flipped90,
+    Flipped180,
+    Flipped270,
+}
+
+impl OutputTransform {
+    fn from_raw(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Normal),
+            1 => Some(Self::Rotate90),
+            2 => Some(Self::Rotate180),
+            3 => Some(Self::Rotate270),
+            4 => Some(Self::Flipped),
+            5 => Some(Self::Flipped90),
+            6 => Some(Self::Flipped180),
+            7 => Some(Self::Flipped270),
+            _ => None,
+        }
+    }
+
+    fn swaps_axes(self) -> bool {
+        matches!(
+            self,
+            Self::Rotate90 | Self::Rotate270 | Self::Flipped90 | Self::Flipped270
+        )
+    }
+
+    fn map_pixel(self, x: u32, y: u32, width: u32, height: u32) -> (u32, u32) {
+        match self {
+            Self::Normal => (x, y),
+            Self::Rotate90 => (y, width - 1 - x),
+            Self::Rotate180 => (width - 1 - x, height - 1 - y),
+            Self::Rotate270 => (height - 1 - y, x),
+            Self::Flipped => (width - 1 - x, y),
+            Self::Flipped90 => (y, x),
+            Self::Flipped180 => (x, height - 1 - y),
+            Self::Flipped270 => (height - 1 - y, width - 1 - x),
+        }
+    }
+}
+
 pub struct CaptureResult {
     pub bytes: Vec<u8>,
     pub width: u32,
@@ -34,13 +83,16 @@ pub struct CaptureResult {
 }
 
 struct OutputInfo {
+    global_name: u32,
     proxy: wl_output::WlOutput,
     scale: i32,
     x: i32,
     y: i32,
     logical_width: u32,
     logical_height: u32,
+    transform: OutputTransform,
     position_known: bool,
+    removed: bool,
     _xdg_output: Option<zxdg_output_v1::ZxdgOutputV1>,
 }
 
@@ -202,11 +254,12 @@ impl State {
     }
 
     fn captures_complete(&self) -> bool {
-        self.captures.len() == self.outputs.len()
-            && self
-                .captures
-                .iter()
-                .all(|capture| capture.bytes.is_some() || capture.failed.is_some())
+        self.setup_error.is_some()
+            || (self.captures.len() == self.outputs.len()
+                && self
+                    .captures
+                    .iter()
+                    .all(|capture| capture.bytes.is_some() || capture.failed.is_some()))
     }
 
     fn begin_overlays(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
@@ -428,6 +481,9 @@ pub fn select_region() -> Result<CaptureResult, String> {
     {
         return Err(error);
     }
+    if let Some(error) = state.setup_error.take() {
+        return Err(error);
+    }
     for (index, output) in state.outputs.iter_mut().enumerate() {
         let scale = output.scale.max(1) as u32;
         if output.logical_width == 0 {
@@ -569,6 +625,49 @@ fn make_file(size: u64) -> Result<File, String> {
     file.set_len(size)
         .map_err(|e| format!("cannot size shared-memory file: {e}"))?;
     Ok(file)
+}
+
+fn transform_pixels(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    transform: OutputTransform,
+) -> Result<(Vec<u8>, u32, u32, u32), String> {
+    let source_len = usize::try_from(stride)
+        .ok()
+        .and_then(|stride| stride.checked_mul(height as usize))
+        .ok_or("captured image is too large")?;
+    if source.len() < source_len || stride < width.saturating_mul(4) {
+        return Err("captured image has an invalid stride".into());
+    }
+    if transform == OutputTransform::Normal {
+        return Ok((source.to_vec(), width, height, stride));
+    }
+
+    let (target_width, target_height) = if transform.swaps_axes() {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let target_stride = target_width
+        .checked_mul(4)
+        .ok_or("transformed image is too wide")?;
+    let target_len = usize::try_from(target_stride)
+        .ok()
+        .and_then(|stride| stride.checked_mul(target_height as usize))
+        .ok_or("transformed image is too large")?;
+    let mut target = vec![0_u8; target_len];
+    for y in 0..height {
+        for x in 0..width {
+            let (target_x, target_y) = transform.map_pixel(x, y, width, height);
+            let source_offset = y as usize * stride as usize + x as usize * 4;
+            let target_offset = target_y as usize * target_stride as usize + target_x as usize * 4;
+            target[target_offset..target_offset + 4]
+                .copy_from_slice(&source[source_offset..source_offset + 4]);
+        }
+    }
+    Ok((target, target_width, target_height, target_stride))
 }
 
 fn prepare_capture_buffer(
@@ -858,13 +957,29 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        else {
-            return;
+        let (name, interface, version) = match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => (name, interface, version),
+            wl_registry::Event::GlobalRemove { name } => {
+                let removed = if let Some(output) = state
+                    .outputs
+                    .iter_mut()
+                    .find(|output| output.global_name == name)
+                {
+                    output.removed = true;
+                    true
+                } else {
+                    false
+                };
+                if removed {
+                    state.fail("an output was removed while snapcrop was active");
+                }
+                return;
+            }
+            _ => return,
         };
         match interface.as_str() {
             "wl_compositor" if state.compositor.is_none() => {
@@ -880,13 +995,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 let index = state.outputs.len();
                 let proxy = registry.bind(name, version.min(4), qh, index);
                 state.outputs.push(OutputInfo {
+                    global_name: name,
                     proxy,
                     scale: 1,
                     x: 0,
                     y: 0,
                     logical_width: 0,
                     logical_height: 0,
+                    transform: OutputTransform::Normal,
                     position_known: false,
+                    removed: false,
                     _xdg_output: None,
                 });
             }
@@ -916,14 +1034,35 @@ impl Dispatch<wl_output::WlOutput, usize> for State {
         let Some(output) = state.outputs.get_mut(*index) else {
             return;
         };
+        let mut changed = false;
         match event {
-            wl_output::Event::Scale { factor } => output.scale = factor.max(1),
-            wl_output::Event::Geometry { x, y, .. } => {
+            wl_output::Event::Scale { factor } => {
+                let factor = factor.max(1);
+                changed = output.scale != factor;
+                output.scale = factor;
+            }
+            wl_output::Event::Geometry {
+                x, y, transform, ..
+            } => {
+                let transform = match transform {
+                    WEnum::Value(transform) => OutputTransform::from_raw(transform as u32),
+                    WEnum::Unknown(_) => None,
+                };
+                let Some(transform) = transform else {
+                    state.fail("compositor reported an unsupported output transform");
+                    return;
+                };
+                changed = output.position_known
+                    && (output.x != x || output.y != y || output.transform != transform);
                 output.x = x;
                 output.y = y;
+                output.transform = transform;
                 output.position_known = true;
             }
             _ => {}
+        }
+        if changed && !state.overlays.is_empty() {
+            state.fail("output geometry changed while snapcrop was active");
         }
     }
 }
@@ -940,17 +1079,26 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, usize> for State {
         let Some(output) = state.outputs.get_mut(*index) else {
             return;
         };
+        let mut changed = false;
         match event {
             zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                changed = output.position_known && (output.x != x || output.y != y);
                 output.x = x;
                 output.y = y;
                 output.position_known = true;
             }
             zxdg_output_v1::Event::LogicalSize { width, height } => {
-                output.logical_width = width.max(0) as u32;
-                output.logical_height = height.max(0) as u32;
+                let width = width.max(0) as u32;
+                let height = height.max(0) as u32;
+                changed = output.logical_width != 0
+                    && (output.logical_width != width || output.logical_height != height);
+                output.logical_width = width;
+                output.logical_height = height;
             }
             _ => {}
+        }
+        if changed && !state.overlays.is_empty() {
+            state.fail("output geometry changed while snapcrop was active");
         }
     }
 }
@@ -987,6 +1135,11 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, usize> for State 
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        let transform = state
+            .outputs
+            .get(*index)
+            .map(|output| output.transform)
+            .unwrap_or_default();
         let Some(job) = state.captures.get_mut(*index) else {
             return;
         };
@@ -1043,6 +1196,19 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, usize> for State 
                     job.failed = Some(error.into());
                     return;
                 }
+                let transformed =
+                    transform_pixels(&bytes, job.width, job.height, job.stride, transform);
+                let (transformed_bytes, width, height, stride) = match transformed {
+                    Ok(image) => image,
+                    Err(error) => {
+                        job.failed = Some(error);
+                        return;
+                    }
+                };
+                bytes = transformed_bytes;
+                job.width = width;
+                job.height = height;
+                job.stride = stride;
                 if job.y_invert {
                     let stride = job.stride as usize;
                     let mut flipped = vec![0; bytes.len()];
@@ -1340,5 +1506,39 @@ mod tests {
             height: 100,
         };
         assert!(intersect_global(selection, output).is_none());
+    }
+
+    #[test]
+    fn normalizes_every_output_transform() {
+        let source: Vec<u8> = (*b"abcdef")
+            .into_iter()
+            .flat_map(|pixel| [pixel, 0, 0, 255])
+            .collect();
+        let cases = [
+            (OutputTransform::Normal, b"abcdef".as_slice(), 2, 3),
+            (OutputTransform::Rotate90, b"bdface".as_slice(), 3, 2),
+            (OutputTransform::Rotate180, b"fedcba".as_slice(), 2, 3),
+            (OutputTransform::Rotate270, b"ecafdb".as_slice(), 3, 2),
+            (OutputTransform::Flipped, b"badcfe".as_slice(), 2, 3),
+            (OutputTransform::Flipped90, b"acebdf".as_slice(), 3, 2),
+            (OutputTransform::Flipped180, b"efcdab".as_slice(), 2, 3),
+            (OutputTransform::Flipped270, b"fdbeca".as_slice(), 3, 2),
+        ];
+
+        for (transform, expected, width, height) in cases {
+            let (pixels, transformed_width, transformed_height, stride) =
+                transform_pixels(&source, 2, 3, 8, transform).unwrap();
+            assert_eq!(
+                (transformed_width, transformed_height, stride),
+                (width, height, width * 4)
+            );
+            let actual: Vec<u8> = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[0])
+                .collect();
+            assert_eq!(actual, expected, "{transform:?}");
+        }
     }
 }

@@ -58,3 +58,6 @@ The release binary links only the Rust/Wayland protocol stack and a PNG encoder.
 Clipboard contents are served by a background instance of the same executable,
 which exits when another application replaces the clipboard.
 
+For rotated, flipped, scaled, and multi-output manual verification, see
+[TESTING.md](TESTING.md).
+
